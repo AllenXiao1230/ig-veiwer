@@ -45,6 +45,28 @@ ig-viewer
 
 目前支援資料中的繁中、簡中與英文使用者名稱欄位。未知檔案不會悄悄併入結果；它會在匯入完成後列出。
 
+## 如何從 Instagram 匯出資料
+
+本程式只讀取你自行向 Meta 申請的資料副本；不需要提供 Instagram 密碼給本程式。Meta 的選單文字可能會隨 App 版本略有不同，請依下列路徑尋找相近項目：
+
+1. 在 Instagram App 開啟個人檔案，點右上角選單，進入「設定和動態」。也可以在網頁版 Instagram 的設定中進入「帳號管理中心（Accounts Center）」。
+2. 開啟「帳號管理中心」→「你的資訊和權限」→「匯出你的資訊」。
+3. 選擇要匯出的 Instagram 帳號，然後選「建立匯出」或「下載或傳輸資訊」。若畫面詢問目的地，選擇「下載到裝置」。
+4. 選擇「部分資訊」，至少勾選「追蹤者與追蹤中」（Followers and following）。若你也想保存其他 Instagram 資訊，可一併選擇；本程式會忽略不支援的資料類型。
+5. 格式務必選 **JSON**，不要選 HTML；媒體品質選擇不影響本程式。設定日期範圍為「所有時間」可避免只匯出部分關係資料。
+6. 提交申請後，Meta 會在資料準備完成時於 App、電子郵件或通知中提供下載。這可能需要一些時間；下載連結可能有期限，請在有效時間內下載 ZIP 檔。
+7. 將 ZIP **完整解壓縮**到本機資料夾（不要直接在壓縮檔中選檔）。保留原有資料夾結構，例如其中可能包含 `connections/followers_and_following/` 與 `followers_1.json`、`following.json`。
+8. 開啟 IG Viewer，按「匯入 Instagram 資料夾」，選擇剛解壓縮的最上層資料夾。匯入完成後即可查看粉絲、追蹤中、互追與未回追結果。
+
+如果只有 `followers_1.json` 而沒有 `following.json`（或反過來），程式仍會匯入可讀取的部分，但無法正確計算互追與未回追。若 Meta 把追蹤者拆成多個 `followers_*.json`，請保留所有分段檔案並選擇最上層資料夾，程式會自動合併。
+
+### 匯出與匯入常見問題
+
+- **找不到可匯入資料：** 確認選的是「已解壓縮」的資料夾，且匯出格式為 JSON，不是 HTML。
+- **數字看起來太少：** 在 Meta 重新申請匯出時，確認日期範圍為「所有時間」，並同時勾選追蹤者與追蹤中資料。
+- **資料夾內有很多無關 JSON：** 直接選最上層資料夾即可；程式只會採用已辨識的帳號關係檔，並列出略過原因。
+- **想更新結果：** 重新申請並下載新的 Instagram 匯出，然後再次匯入新資料夾。原始資料變更時，本機快取會自動失效。
+
 ## 使用方式
 
 - 首次使用時，中央畫面會說明資料只在本機讀取；建議使用「匯入 Instagram 資料夾」，讓程式自動找出 JSON。已知檔案時才使用「選擇 JSON 檔案」。
@@ -90,3 +112,13 @@ bash scripts/build_macos_app.sh
 ```
 
 產物位於 `dist/IG Viewer.zip`。解壓縮後取得 `IG Viewer.app`。它是未 notarize 的本機建置；若 macOS 顯示安全提示，請在 Finder 對 App 按右鍵並選擇「打開」。若要散布給其他人，仍需另外處理 Apple Developer 簽署與 notarization。
+
+## Windows App 封裝
+
+Windows `.exe` 必須在 Windows 電腦上建置（PyInstaller 不支援從 macOS 交叉建置 Windows 執行檔）。先安裝 [Python 3.10 以上](https://www.python.org/downloads/windows/)，安裝時勾選「Add python.exe to PATH」，再於專案根目錄以檔案總管雙擊或在命令提示字元執行：
+
+```bat
+scripts\build_windows_app.bat
+```
+
+產物為 `dist\IG Viewer\IG Viewer.exe`，以及可分享的 `dist\IG Viewer Windows.zip`。解壓縮 ZIP 後執行 `IG Viewer.exe`；不要只單獨搬移 `.exe`，因為同資料夾內的 Qt 元件也是程式運作所需。此為未簽署建置，首次在其他電腦開啟時可能出現 Windows SmartScreen 警告；發佈給他人前，建議使用 Windows 程式碼簽署憑證簽署。
