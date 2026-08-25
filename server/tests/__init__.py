@@ -1,0 +1,1 @@
+"""IG Trends service tests."""

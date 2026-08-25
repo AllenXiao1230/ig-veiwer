@@ -1,0 +1,21 @@
+# Sensitive Instagram export data and local state
+data/
+*.cache
+.DS_Store
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+build/
+dist/
+.pyinstaller-build/
+*.spec
+
+# Local application state is stored outside this repository by default.

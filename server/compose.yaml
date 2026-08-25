@@ -1,0 +1,42 @@
+name: ig-trends
+
+services:
+  ig-trends:
+    build:
+      context: ..
+      dockerfile: server/Dockerfile
+    env_file: .env
+    ports:
+      - "${IG_TRENDS_BIND_HOST:-127.0.0.1}:${IG_TRENDS_PORT:-8085}:8080"
+    volumes:
+      - ig-trends-data:/data
+      # A trusted sync job or operator can place a complete daily export here.
+      - ./incoming:/incoming:ro
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  # Opt-in only: pull an Instagram-managed Google Drive export into /incoming/current.
+  # It does not start until the `google-drive` profile is explicitly enabled.
+  gdrive-sync:
+    image: rclone/rclone:1.69.1
+    profiles: ["google-drive"]
+    env_file: .env
+    environment:
+      RCLONE_CONFIG: /config/rclone/rclone.conf
+    volumes:
+      - gdrive-rclone-config:/config/rclone
+      - ./incoming:/incoming
+      - ./scripts/sync-google-drive.sh:/usr/local/bin/sync-google-drive.sh:ro
+    entrypoint: ["/bin/sh", "/usr/local/bin/sync-google-drive.sh"]
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+volumes:
+  ig-trends-data:
+  gdrive-rclone-config:
