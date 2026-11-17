@@ -11,13 +11,9 @@ trap 'rm -rf "$build_dir"' EXIT
 python3 -m pip install -r requirements-dev.txt
 python3 -m PyInstaller \
   --noconfirm \
-  --windowed \
-  --name "IG Viewer" \
-  --osx-bundle-identifier "com.xuan.igviewer" \
   --workpath "$build_dir/work" \
   --distpath "$build_dir/dist" \
-  --specpath "$build_dir/spec" \
-  main.py
+  scripts/ig_viewer.spec
 
 app_path="$build_dir/dist/IG Viewer.app"
 # Build and sign outside synced folders. iCloud/File Provider may attach Finder

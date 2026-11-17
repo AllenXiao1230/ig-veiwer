@@ -2,17 +2,13 @@
 
 from __future__ import annotations
 
-import csv
+from datetime import datetime
 from pathlib import Path
 import sys
-from urllib.parse import quote
-import webbrowser
 
-from PySide6.QtCharts import QChart, QChartView, QLineSeries, QValueAxis
-from PySide6.QtCore import QDate, QModelIndex, QThread, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QAction, QColor, QKeySequence, QPainter
-from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile
-from PySide6.QtWebEngineWidgets import QWebEngineView
+from PySide6.QtCharts import QChart, QChartView, QDateTimeAxis, QLineSeries, QValueAxis
+from PySide6.QtCore import QDate, QDateTime, QModelIndex, Qt, QTimer, QUrl
+from PySide6.QtGui import QAction, QColor, QDesktopServices, QIcon, QKeySequence, QPainter
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -43,29 +39,23 @@ from PySide6.QtWidgets import (
 )
 
 from igviewer.data import (
-    KEY_FOLLOWERS,
-    KEY_FOLLOWING,
     KEY_MUTUAL,
     KEY_NOT_FOLLOWED_BACK,
     KEY_NOT_FOLLOWING_BACK,
     SENSITIVE_DATASETS,
-    ImportResult,
     Record,
-    build_insights,
-    discover_export_files,
-    import_files,
     relationship_metrics,
 )
+from igviewer.exporting import export_records, export_relationship_summary, safe_csv_value
+from igviewer.profiles import ProfilePreview, profile_url
 from igviewer.models import RecordFilterProxyModel, RecordTableModel
 from igviewer.storage import (
-    append_snapshot,
     application_data_dir,
     clear_cache as clear_safe_cache,
     compare_with_previous,
     load_snapshots,
-    load_valid_cache,
-    save_cache,
 )
+from igviewer.workers import FileLoaderWorker, LoadedData
 
 
 DARK_STYLE = """
@@ -105,6 +95,7 @@ DARK_STYLE = """
     QWidget#emptyState { background-color: #252526; }
     QLabel#emptyTitle { font-size: 20pt; font-weight: bold; color: #f0f0f0; }
     QLabel#emptyDescription { color: #b8b8b8; }
+    QWidget#emptyState QLabel { background-color: transparent; }
     QLabel#privacyNotice { color: #8bd5a3; }
     QPushButton:focus, QToolButton:focus, QLineEdit:focus, QDateEdit:focus, QComboBox:focus, QListWidget:focus, QTreeView:focus {
         border: 2px solid #66d9ff;
@@ -119,23 +110,6 @@ DARK_STYLE = """
     QLabel#unrequitedLabel { color: #f44747; }
     QLabel#notFollowedBackLabel { color: #c586c0; }
 """
-
-
-class FileLoaderWorker(QThread):
-    finished = Signal(object)
-    progress = Signal(int, int)
-    error = Signal(str)
-
-    def __init__(self, filepaths: list[Path], parent: QWidget | None = None):
-        super().__init__(parent)
-        self.filepaths = filepaths
-
-    def run(self) -> None:
-        try:
-            result = import_files(self.filepaths, self.progress.emit)
-            self.finished.emit(result)
-        except Exception as exc:  # pragma: no cover - defensive UI boundary
-            self.error.emit(f"匯入未完成：{exc}。請確認 JSON 檔案可讀取後再試一次。")
 
 
 class IGMultiFileDashboard(QMainWindow):
@@ -155,12 +129,19 @@ class IGMultiFileDashboard(QMainWindow):
         self.current_data_source: list[Record] = []
         self.opened_usernames: set[str] = set()
         self.worker: FileLoaderWorker | None = None
+        self._closing = False
+        self.snapshots: list[dict] = []
+        self.current_snapshot: dict | None = None
         self._open_queue: list[str] = []
         self._batch_opening = False
         self.search_debounce = QTimer(self)
         self.search_debounce.setSingleShot(True)
         self.search_debounce.setInterval(180)
         self.search_debounce.timeout.connect(self.filter_data)
+        self.batch_timer = QTimer(self)
+        self.batch_timer.setSingleShot(True)
+        self.batch_timer.setInterval(800)
+        self.batch_timer.timeout.connect(self._open_next_profile)
 
         self.create_widgets()
         self._load_cache()
@@ -200,6 +181,11 @@ class IGMultiFileDashboard(QMainWindow):
         self.action_history = self.tools_menu.addAction("查看關係快照紀錄", self.show_snapshot_history)
         self.action_chart = self.tools_menu.addAction("查看關係趨勢圖", self.show_snapshot_chart)
         self.tools_menu.addSeparator()
+        self.action_preview = self.tools_menu.addAction("顯示帳號預覽")
+        self.action_preview.setCheckable(True)
+        self.action_preview.setChecked(True)
+        self.action_preview.toggled.connect(lambda visible: self.preview_panel.setVisible(visible))
+        self.action_reset_opened = self.tools_menu.addAction("重設開啟記錄", self.reset_opened_status)
         self.action_clear_cache = self.tools_menu.addAction("清除本機安全快取…", self.clear_cache)
         self.menuBar().addAction("關於", self.show_about_dialog)
 
@@ -249,6 +235,7 @@ class IGMultiFileDashboard(QMainWindow):
         self.date_filter_enabled.toggled.connect(self.toggle_date_filter)
         search_row.addWidget(self.date_filter_enabled)
         self.date_start = QDateEdit(calendarPopup=True)
+        self.date_start.setAccessibleName("篩選開始日期")
         self.date_start.setDate(QDate.currentDate().addYears(-10))
         self.date_start.dateChanged.connect(self.filter_data)
         self.date_start.setVisible(False)
@@ -257,6 +244,7 @@ class IGMultiFileDashboard(QMainWindow):
         self.date_separator.setVisible(False)
         search_row.addWidget(self.date_separator)
         self.date_end = QDateEdit(calendarPopup=True)
+        self.date_end.setAccessibleName("篩選結束日期")
         self.date_end.setDate(QDate.currentDate())
         self.date_end.dateChanged.connect(self.filter_data)
         self.date_end.setVisible(False)
@@ -325,45 +313,9 @@ class IGMultiFileDashboard(QMainWindow):
         list_layout.addWidget(self.batch_bar)
         splitter.addWidget(list_panel)
 
-        browser_panel = QGroupBox("帳號預覽")
-        browser_panel.setMinimumWidth(280)
-        browser_layout = QVBoxLayout(browser_panel)
-        browser_layout.setContentsMargins(6, 8, 6, 6)
-        browser_toolbar = QHBoxLayout()
-        self.browser_status = QLabel("選取帳號後可在此預覽 Instagram；預覽可能需要 Instagram 登入。")
-        browser_toolbar.addWidget(self.browser_status, 1)
-        self.btn_browser_back = QPushButton("上一頁")
-        self.btn_browser_back.setToolTip("上一頁")
-        self.btn_browser_back.setAccessibleName("預覽上一頁")
-        self.btn_browser_back.clicked.connect(lambda: self.profile_browser.back())
-        browser_toolbar.addWidget(self.btn_browser_back)
-        self.btn_browser_refresh = QPushButton("重新整理")
-        self.btn_browser_refresh.setToolTip("重新整理")
-        self.btn_browser_refresh.setAccessibleName("重新整理帳號預覽")
-        self.btn_browser_refresh.clicked.connect(lambda: self.profile_browser.reload())
-        browser_toolbar.addWidget(self.btn_browser_refresh)
-        self.btn_browser_external = QPushButton("在瀏覽器開啟")
-        self.btn_browser_external.setToolTip("以系統瀏覽器開啟目前頁面")
-        self.btn_browser_external.setAccessibleName("在系統瀏覽器開啟目前預覽頁面")
-        self.btn_browser_external.clicked.connect(self.open_current_profile_externally)
-        browser_toolbar.addWidget(self.btn_browser_external)
-        browser_layout.addLayout(browser_toolbar)
-
-        self.browser_profile = QWebEngineProfile(self)
-        browser_data_dir = application_data_dir() / "browser-profile"
-        self.browser_profile.setPersistentStoragePath(str(browser_data_dir))
-        self.browser_profile.setCachePath(str(browser_data_dir / "cache"))
-        self.profile_browser = QWebEngineView()
-        self.profile_browser.setPage(QWebEnginePage(self.browser_profile, self.profile_browser))
-        self.profile_browser.urlChanged.connect(self.on_browser_url_changed)
-        self.profile_browser.loadFinished.connect(self.on_browser_load_finished)
-        self.profile_browser.setHtml(
-            "<body style='background:#252526;color:#d4d4d4;font-family:Helvetica;"
-            "display:flex;align-items:center;justify-content:center;height:95vh;'>"
-            "<p>選取帳號以預覽 Instagram 個人主頁；預覽可能需要登入。</p></body>"
-        )
-        browser_layout.addWidget(self.profile_browser, 1)
-        splitter.addWidget(browser_panel)
+        self.preview_panel = ProfilePreview(self)
+        self.preview_panel.message.connect(self.statusBar().showMessage)
+        splitter.addWidget(self.preview_panel)
         splitter.setSizes([220, 520, 500])
         return splitter
 
@@ -385,13 +337,12 @@ class IGMultiFileDashboard(QMainWindow):
         self.empty_description.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.empty_description.setWordWrap(True)
         layout.addWidget(self.empty_description)
-        self.privacy_notice = QLabel("只讀取你選擇的本機 JSON；不登入、不使用 API，也不執行追蹤操作。")
+        self.privacy_notice = QLabel("匯入與分析本機 JSON 無需登入 Instagram。")
         self.privacy_notice.setObjectName("privacyNotice")
         self.privacy_notice.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.privacy_notice.setWordWrap(True)
         layout.addWidget(self.privacy_notice)
-        actions = QHBoxLayout()
-        actions.addStretch(1)
+        actions = QVBoxLayout()
         self.empty_import_folder = QPushButton("匯入 Instagram 資料夾")
         self.empty_import_folder.setObjectName("actionButton")
         self.empty_import_folder.clicked.connect(self.import_export_folder)
@@ -403,44 +354,42 @@ class IGMultiFileDashboard(QMainWindow):
         self.empty_clear_filters.clicked.connect(self.clear_filters)
         self.empty_clear_filters.setVisible(False)
         actions.addWidget(self.empty_clear_filters)
-        actions.addStretch(1)
         layout.addLayout(actions)
         layout.addStretch(1)
         return state
 
     def _create_batch_bar(self) -> QWidget:
         bar = QWidget()
-        layout = QHBoxLayout(bar)
+        layout = QVBoxLayout(bar)
         layout.setContentsMargins(0, 8, 0, 0)
         layout.setSpacing(6)
+        scope_row = QHBoxLayout()
         self.open_scope = QComboBox()
         self.open_scope.addItem("已選取帳號", "selected")
         self.open_scope.addItem("篩選結果", "filtered")
         self.open_scope.setAccessibleName("選擇批次開啟範圍")
         self.open_scope.setMinimumWidth(132)
         self.open_scope.currentIndexChanged.connect(self._update_action_availability)
-        layout.addWidget(QLabel("開啟範圍"))
-        layout.addWidget(self.open_scope)
-        layout.addSpacing(6)
+        scope_row.addWidget(self.open_scope)
         self.open_combo = QComboBox()
         self.open_combo.addItems(["1", "5", "10", "20", "50"])
         self.open_combo.setCurrentText("5")
         self.open_combo.setAccessibleName("批次開啟數量")
         self.open_combo.setMinimumWidth(68)
-        layout.addWidget(QLabel("數量"))
-        layout.addWidget(self.open_combo)
-        layout.addSpacing(8)
+        scope_row.addWidget(QLabel("數量"))
+        scope_row.addWidget(self.open_combo)
+        scope_row.addStretch(1)
+        layout.addLayout(scope_row)
+        action_row = QHBoxLayout()
         self.btn_open_ig = QPushButton("在瀏覽器開啟")
         self.btn_open_ig.setObjectName("actionButton")
         self.btn_open_ig.clicked.connect(self.open_ig_pages)
-        layout.addWidget(self.btn_open_ig)
+        action_row.addWidget(self.btn_open_ig)
         self.btn_cancel_open = QPushButton("取消批次開啟")
         self.btn_cancel_open.clicked.connect(self.cancel_opening_profiles)
-        layout.addWidget(self.btn_cancel_open)
-        self.btn_reset_opened = QPushButton("重設開啟記錄")
-        self.btn_reset_opened.clicked.connect(self.reset_opened_status)
-        layout.addWidget(self.btn_reset_opened)
-        layout.addStretch(1)
+        action_row.addWidget(self.btn_cancel_open)
+        action_row.addStretch(1)
+        layout.addLayout(action_row)
         return bar
 
     def _set_import_busy(self, busy: bool) -> None:
@@ -495,12 +444,11 @@ class IGMultiFileDashboard(QMainWindow):
         scope_has_records = has_selection if self.open_scope.currentData() == "selected" else has_filtered_records
         self.btn_open_ig.setEnabled(scope_has_records and not opening)
         self.btn_cancel_open.setEnabled(opening)
-        self.btn_reset_opened.setEnabled(bool(self.opened_usernames) and not opening)
+        self.action_reset_opened.setEnabled(bool(self.opened_usernames) and not opening)
         self.action_export.setEnabled(has_filtered_records)
         self.action_export_summary.setEnabled(bool(self.datasets))
-        snapshots = load_snapshots()
-        self.action_history.setEnabled(bool(snapshots))
-        self.action_chart.setEnabled(len(snapshots) >= 2)
+        self.action_history.setEnabled(bool(self.snapshots))
+        self.action_chart.setEnabled(len(self.snapshots) >= 2)
 
     def toggle_date_filter(self, enabled: bool) -> None:
         """Only reveal date inputs when the user has requested date filtering."""
@@ -516,71 +464,88 @@ class IGMultiFileDashboard(QMainWindow):
         directory = QFileDialog.getExistingDirectory(self, "選取 Instagram 匯出資料夾")
         if not directory:
             return
-        names = discover_export_files(directory)
-        if not names:
-            QMessageBox.warning(self, "找不到資料", "此資料夾及其子資料夾中沒有 JSON 檔案。")
-            return
-        self._start_import(names, f"資料夾中的 {len(names)} 個 JSON")
+        self._start_import([], "匯出資料夾", directory=Path(directory))
 
-    def _start_import(self, filepaths: list[Path], source_description: str) -> None:
-        if not filepaths:
+    def _start_import(self, filepaths: list[Path], source_description: str, directory: Path | None = None) -> None:
+        if self.worker is not None or (not filepaths and directory is None):
             return
+        self.cancel_opening_profiles()
+        self._start_worker(FileLoaderWorker(filepaths, self, directory=directory), f"正在讀取{source_description}…")
+
+    def _start_worker(self, worker: FileLoaderWorker, message: str) -> None:
         self._set_import_busy(True)
-        self.statusBar().showMessage(f"正在讀取{source_description}…")
-        self.worker = FileLoaderWorker(filepaths, self)
+        self.statusBar().showMessage(message)
+        self.worker = worker
         self.worker.progress.connect(self.on_import_progress)
-        self.worker.finished.connect(self.on_import_finished)
+        self.worker.status.connect(self.statusBar().showMessage)
+        self.worker.result_ready.connect(self.on_import_finished)
         self.worker.error.connect(self.on_import_error)
+        self.worker.finished.connect(self._on_worker_stopped)
+        self.worker.finished.connect(self.worker.deleteLater)
         self.worker.start()
+
+    def _on_worker_stopped(self) -> None:
+        self.worker = None
+        self._set_import_busy(False)
+        if self._closing:
+            QTimer.singleShot(0, self.close)
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        self.search_debounce.stop()
+        self.cancel_opening_profiles()
+        if self.worker is not None:
+            self._closing = True
+            self.worker.requestInterruption()
+            self.statusBar().showMessage("正在結束資料讀取，完成後會自動關閉…")
+            event.ignore()
+            return
+        event.accept()
 
     def on_import_progress(self, count: int, total: int) -> None:
         self.statusBar().showMessage(f"正在匯入檔案…({count}/{total})")
 
     def on_import_error(self, message: str) -> None:
-        self._set_import_busy(False)
+        if self._closing:
+            return
         QMessageBox.critical(self, "匯入錯誤", message)
         self.statusBar().showMessage("匯入失敗。", 5000)
 
-    def on_import_finished(self, result: ImportResult) -> None:
-        self._set_import_busy(False)
-        if not result.datasets:
+    def on_import_finished(self, loaded: LoadedData) -> None:
+        if self._closing:
+            return
+        result = loaded.imported
+        if loaded.from_cache:
+            self.snapshots = loaded.snapshots
+            self.current_snapshot = loaded.snapshot
+            self.raw_datasets = result.datasets
+            self.datasets = loaded.datasets
+            self.refresh_dashboard()
+            self.update_sidebar()
+            self._update_action_availability()
+            self.statusBar().showMessage(loaded.message, 8000)
+            return
+        if result.has_blocking_issues or not result.datasets:
             details = self._format_issues(result)
-            QMessageBox.warning(self, "沒有可匯入的資料", details or "所選 JSON 不含支援的帳號資料。")
-            self.statusBar().showMessage("沒有可匯入的資料。", 5000)
+            QMessageBox.warning(self, "匯入資料不完整", details or "所選資料夾或 JSON 不含支援的帳號資料。")
+            self.statusBar().showMessage("請重新提供完整的 Instagram 匯出資料。", 5000)
             return
         self.raw_datasets = result.datasets
         self.sources = result.sources
-        self.datasets = build_insights(self.raw_datasets)
-        persistence_warning = ""
-        try:
-            save_cache(self.raw_datasets, self.sources)
-        except OSError:
-            persistence_warning = " 無法儲存本機快取；請檢查本機儲存空間與權限。"
-        snapshot_message = ""
-        if KEY_FOLLOWERS in self.raw_datasets and KEY_FOLLOWING in self.raw_datasets:
-            try:
-                snapshot, created = append_snapshot(self.datasets)
-                comparison = compare_with_previous(snapshot)
-                if created:
-                    snapshot_message = "已建立快照。"
-                    if comparison:
-                        snapshot_message += f" 與前次相比：+{comparison['new_followers']} 粉絲、-{comparison['lost_followers']} 粉絲。"
-                else:
-                    snapshot_message = "資料與最近快照相同，未重複建立。"
-            except OSError:
-                persistence_warning += " 無法儲存快照；請檢查本機儲存空間與權限。"
+        self.datasets = loaded.datasets
+        self.snapshots = loaded.snapshots
+        self.current_snapshot = loaded.snapshot
         self.refresh_dashboard()
         self.update_sidebar()
         details = self._format_issues(result)
         message = (
             f"已載入 {result.files_loaded} 個檔案、{result.records_after_deduplication} 筆資料"
-            f"（合併去除 {result.duplicate_count} 筆重複）。{snapshot_message}{persistence_warning}"
+            f"（合併去除 {result.duplicate_count} 筆重複）。{loaded.message}"
         )
         self.statusBar().showMessage(message, 12000)
         if details:
             QMessageBox.information(self, "匯入完成，但有需注意的檔案", f"{message}\n\n{details}")
 
-    def _format_issues(self, result: ImportResult) -> str:
+    def _format_issues(self, result) -> str:
         if not result.issues:
             return ""
         visible = result.issues[:12]
@@ -617,6 +582,7 @@ class IGMultiFileDashboard(QMainWindow):
         if key not in self.datasets:
             return
         self.current_key = key
+        self.cancel_opening_profiles()
         self.current_data_source = list(self.datasets[key])
         self.opened_usernames.clear()
         self.table_model.set_records(self.current_data_source)
@@ -628,15 +594,7 @@ class IGMultiFileDashboard(QMainWindow):
         self.statusBar().showMessage(f"顯示「{key}」：{len(self.current_data_source)} 筆", 3000)
 
     def _load_cache(self) -> None:
-        cache = load_valid_cache()
-        if cache.datasets is None:
-            self.statusBar().showMessage(cache.message, 8000)
-            return
-        self.raw_datasets = cache.datasets
-        self.datasets = build_insights(self.raw_datasets)
-        self.refresh_dashboard()
-        self.update_sidebar()
-        self.statusBar().showMessage(cache.message, 5000)
+        self._start_worker(FileLoaderWorker(parent=self, from_cache=True), "正在檢查本機快取…")
 
     def clear_cache(self) -> None:
         reply = QMessageBox.question(
@@ -648,7 +606,13 @@ class IGMultiFileDashboard(QMainWindow):
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
-        removed = clear_safe_cache()
+        self.cancel_opening_profiles()
+        try:
+            removed = clear_safe_cache()
+        except OSError as exc:
+            QMessageBox.critical(self, "清除失敗", f"請檢查本機資料位置與權限。\n{exc}")
+            return
+        self.current_snapshot = None
         self.raw_datasets = {}
         self.datasets = {}
         self.sources = []
@@ -685,29 +649,13 @@ class IGMultiFileDashboard(QMainWindow):
             self.load_profile_in_browser(username)
 
     def load_profile_in_browser(self, username: str) -> None:
-        self.browser_status.setText(f"正在開啟 @{username}…")
-        self.profile_browser.setUrl(QUrl(self.profile_url(username)))
-
-    def on_browser_url_changed(self, url: QUrl) -> None:
-        if url.host().endswith("instagram.com"):
-            self.btn_browser_external.setToolTip(f"以系統瀏覽器開啟：{url.toString()}")
-
-    def on_browser_load_finished(self, success: bool) -> None:
-        if success:
-            self.browser_status.setText("帳號預覽已載入。登入狀態僅儲存在本機瀏覽器資料中。")
-        else:
-            self.browser_status.setText("預覽載入失敗；可改在系統瀏覽器開啟。")
-
-    def open_current_profile_externally(self) -> None:
-        url = self.profile_browser.url()
-        if url.isValid() and url.scheme() in {"http", "https"}:
-            webbrowser.open_new_tab(url.toString())
+        self.preview_panel.load_profile_in_browser(username)
 
     def _usernames_for_open_scope(self, limit: int) -> list[str]:
         if self.open_scope.currentData() == "selected":
             indexes = self.tree.selectionModel().selectedRows()
         else:
-            indexes = [self.table_proxy.index(row, 0) for row in range(min(limit, self.table_proxy.rowCount()))]
+            indexes = (self.table_proxy.index(row, 0) for row in range(self.table_proxy.rowCount()))
         usernames: list[str] = []
         for index in indexes:
             record = self.table_model.record_at(self.table_proxy.mapToSource(index).row())
@@ -722,7 +670,7 @@ class IGMultiFileDashboard(QMainWindow):
 
     @staticmethod
     def profile_url(username: str) -> str:
-        return f"https://www.instagram.com/{quote(username.strip(), safe='._')}/"
+        return profile_url(username)
 
     def open_ig_pages(self) -> None:
         limit = int(self.open_combo.currentText())
@@ -753,13 +701,19 @@ class IGMultiFileDashboard(QMainWindow):
             self.statusBar().showMessage("已完成批次開啟。", 4000)
             return
         username = self._open_queue.pop(0)
-        webbrowser.open_new_tab(self.profile_url(username))
+        if not QDesktopServices.openUrl(QUrl(self.profile_url(username))):
+            self._open_queue.clear()
+            self._batch_opening = False
+            self._update_action_availability()
+            self.statusBar().showMessage("無法開啟瀏覽器，已停止批次開啟。", 5000)
+            return
         self.opened_usernames.add(username.casefold())
         self.table_model.mark_opened(username)
         self.statusBar().showMessage(f"正在開啟帳號；剩餘 {len(self._open_queue)} 個。")
-        QTimer.singleShot(800, self._open_next_profile)
+        self.batch_timer.start()
 
     def cancel_opening_profiles(self) -> None:
+        self.batch_timer.stop()
         if not self._batch_opening:
             return
         remaining = len(self._open_queue)
@@ -793,7 +747,7 @@ class IGMultiFileDashboard(QMainWindow):
 
     @staticmethod
     def _safe_csv_value(value: str) -> str:
-        return f"'{value}" if value.lstrip().startswith(("=", "+", "-", "@")) else value
+        return safe_csv_value(value)
 
     def export_csv(self) -> None:
         records = self.table_proxy.filtered_records()
@@ -814,11 +768,7 @@ class IGMultiFileDashboard(QMainWindow):
         if not path:
             return
         try:
-            with open(path, "w", newline="", encoding="utf-8-sig") as handle:
-                writer = csv.writer(handle)
-                writer.writerow(["用戶名稱 (Username)", "顯示名稱 / 相關資訊", "時間紀錄"])
-                for record in records:
-                    writer.writerow([self._safe_csv_value(value) for value in record])
+            export_records(path, records)
             self.statusBar().showMessage(f"已匯出目前篩選結果：{path}", 5000)
         except OSError:
             QMessageBox.critical(self, "匯出失敗", "無法寫入檔案。請檢查儲存位置與權限後再試一次。")
@@ -830,33 +780,17 @@ class IGMultiFileDashboard(QMainWindow):
         path, _ = QFileDialog.getSaveFileName(self, "匯出關係摘要", "ig_relationship_summary.csv", "CSV Files (*.csv)")
         if not path:
             return
-        metrics = relationship_metrics(self.datasets)
-        latest = load_snapshots()[-1] if load_snapshots() else {}
-        comparison = compare_with_previous(latest) if latest else None
-        rows = [
-            ("指標", "數值"),
-            ("粉絲", metrics["followers"]),
-            ("追蹤中", metrics["following"]),
-            ("雙向互相追蹤", metrics["mutual"]),
-            ("對方未回追", metrics["not_following_back"]),
-            ("你尚未回追", metrics["not_followed_back"]),
-        ]
-        if comparison:
-            rows.extend([
-                ("相較前次新增粉絲", comparison["new_followers"]),
-                ("相較前次流失粉絲", comparison["lost_followers"]),
-                ("相較前次新增追蹤", comparison["new_following"]),
-                ("相較前次取消追蹤", comparison["unfollowed"]),
-            ])
+        comparison = compare_with_previous(self.current_snapshot, self.snapshots) if self.current_snapshot else None
         try:
-            with open(path, "w", newline="", encoding="utf-8-sig") as handle:
-                csv.writer(handle).writerows(rows)
+            export_relationship_summary(path, self.datasets, comparison)
             self.statusBar().showMessage(f"已匯出摘要：{path}", 5000)
         except OSError:
             QMessageBox.critical(self, "匯出失敗", "無法寫入檔案。請檢查儲存位置與權限後再試一次。")
 
     def show_snapshot_history(self) -> None:
         snapshots = load_snapshots()
+        self.snapshots = snapshots
+        self._update_action_availability()
         if not snapshots:
             QMessageBox.information(self, "快照紀錄", "尚無快照。匯入同時包含粉絲與追蹤中的資料後會自動建立。")
             return
@@ -885,6 +819,8 @@ class IGMultiFileDashboard(QMainWindow):
 
     def show_snapshot_chart(self) -> None:
         snapshots = load_snapshots()
+        self.snapshots = snapshots
+        self._update_action_availability()
         if len(snapshots) < 2:
             QMessageBox.information(
                 self,
@@ -893,7 +829,7 @@ class IGMultiFileDashboard(QMainWindow):
             )
             return
         chart = QChart()
-        chart.setTitle("關係快照趨勢（由舊到新）")
+        chart.setTitle("關係快照趨勢")
         chart.legend().setVisible(True)
         series_definitions = [
             ("粉絲", "followers", "#4fc1ff"),
@@ -903,20 +839,21 @@ class IGMultiFileDashboard(QMainWindow):
             ("尚未回追", "not_followed_back", "#c586c0"),
         ]
         maximum = 1
+        timestamps = [int(datetime.fromisoformat(snapshot["created_at"]).timestamp() * 1000) for snapshot in snapshots]
         for label, metric, color in series_definitions:
             series = QLineSeries()
             series.setName(label)
             series.setColor(QColor(color))
-            for index, snapshot in enumerate(snapshots, start=1):
+            for timestamp, snapshot in zip(timestamps, snapshots):
                 value = int(snapshot.get("metrics", {}).get(metric, 0))
                 maximum = max(maximum, value)
-                series.append(index, value)
+                series.append(timestamp, value)
             chart.addSeries(series)
-        axis_x = QValueAxis()
-        axis_x.setTitleText("快照順序")
-        axis_x.setRange(1, len(snapshots))
+        axis_x = QDateTimeAxis()
+        axis_x.setTitleText("快照時間")
+        axis_x.setRange(QDateTime.fromMSecsSinceEpoch(min(timestamps)), QDateTime.fromMSecsSinceEpoch(max(max(timestamps), min(timestamps) + 1000)))
         axis_x.setTickCount(min(len(snapshots), 6))
-        axis_x.setLabelFormat("%.0f")
+        axis_x.setFormat("MM-dd HH:mm")
         axis_y = QValueAxis()
         axis_y.setTitleText("帳號數")
         axis_y.setRange(0, maximum)
@@ -947,13 +884,15 @@ class IGMultiFileDashboard(QMainWindow):
             self,
             "關於 Instagram 數據分析",
             "<b>Instagram 數據分析（離線）</b><br><br>"
-            "僅讀取使用者自行下載的 Instagram JSON；不登入、不呼叫 API、不執行追蹤操作。<br><br>"
+            "分析自行下載的 Instagram JSON 無需登入，也不會呼叫 API 或執行追蹤操作。<br><br>"
             f"本機安全資料位置：<br>{application_data_dir()}",
         )
 
 
 def main() -> int:
     app = QApplication(sys.argv)
+    icon_path = Path(__file__).resolve().parent / "igviewer" / "assets" / "ig-viewer.ico"
+    app.setWindowIcon(QIcon(str(icon_path)))
     app.setStyleSheet(DARK_STYLE)
     window = IGMultiFileDashboard()
     window.show()

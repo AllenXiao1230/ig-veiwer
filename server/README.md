@@ -21,7 +21,7 @@ SQLite 快照 + 原始 JSON 歸檔（Docker Volume）
                 └─ Web 儀表板與健康檢查
 ```
 
-每份快照必須同時包含 `followers_*.json` 與 `following.json`；服務會合併所有粉絲分段檔、依使用者名稱去重，並以來源內容 SHA-256 防止相同快照重複寫入。
+每份快照必須同時包含完整可讀取的 `followers_*.json` 與 `following.json`，合法空清單也會計入。服務會合併粉絲分段、依使用者名稱去重，並先固定來源副本再解析及歸檔。來源檔案順序不影響 SHA-256；連續相同內容會回傳 `unchanged`，A → B → A 會建立三筆時間紀錄並重用 A 的歸檔。
 
 ## Instagram 資料來源的安全邊界
 
@@ -109,12 +109,12 @@ curl --fail-with-body \
 
 受 Token 保護的端點：
 
-- `POST /api/v1/ingest/upload`：上傳一組 JSON（總大小上限 250 MB）。
+- `POST /api/v1/ingest/upload`：上傳一組 JSON（完整 request body 上限 250 MB，包含 multipart 編碼）。驗證與大小限制會在檔案解析前及串流接收時執行。
 - `POST /api/v1/ingest/scan`：立即掃描收件目錄。
 - `GET /api/v1/latest`：最新快照與指標。
 - `GET /api/v1/trends`：快照趨勢，預設最多 90 筆。
-- `GET /api/v1/accounts?view=mutual|not_following_back|not_followed_back`：最新關係清單。
-- `GET /api/health`：不含敏感資訊的健康檢查。
+- `GET /api/v1/accounts?view=mutual|not_following_back|not_followed_back`：最新關係清單，可用 `query`、`limit` 與 `offset` 搜尋及分頁。
+- `GET /api/health`：健康檢查，包含最近匯入狀態、最近成功時間及錯誤摘要。
 
 首頁 `/` 是摘要儀表板。若你將它透過反向代理公開，務必在代理層要求 HTTPS 與登入／存取控制。
 
@@ -122,11 +122,12 @@ curl --fail-with-body \
 
 - 原始 JSON 歸檔預設保留 90 天，可用 `IG_TRENDS_ARCHIVE_RETENTION_DAYS` 調整；設為 `0` 代表不自動刪除。
 - SQLite 快照記錄會持續保留。
-- 建議在伺服器上定期備份 `/data`：
+- 使用 SQLite 備份功能建立一致副本，並另行保存原始 JSON 歸檔目錄：
 
 ```bash
 cd /srv/ig-trends/server
-docker compose exec -T ig-trends tar -C /data -czf - . > ig-trends-backup-$(date +%F).tar.gz
+docker compose exec -T ig-trends python -m app.backup /data/ig-trends-backup.sqlite3
+docker compose cp ig-trends:/data/ig-trends-backup.sqlite3 ./ig-trends-backup.sqlite3
 ```
 
 先測試還原檔案，再建立任何保留／刪除排程。
@@ -136,7 +137,6 @@ docker compose exec -T ig-trends tar -C /data -czf - . > ig-trends-backup-$(date
 Docker CLI 不可用時，仍可測試核心與 API：
 
 ```bash
-python3 -m unittest discover -v
-python3 -m pip install --target /tmp/ig-trends-deps -r server/requirements-dev.txt
-PYTHONPATH=/tmp/ig-trends-deps:. python3 -c "from server.app.main import app; print(app.title)"
+python3 -m pip install -r server/requirements-dev.txt
+python3 -m unittest discover -s server/tests -v
 ```

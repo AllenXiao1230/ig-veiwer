@@ -18,3 +18,6 @@ py-modules = ["main"]
 
 [tool.setuptools.packages.find]
 include = ["igviewer*"]
+
+[tool.setuptools.package-data]
+igviewer = ["assets/ig-viewer.ico"]

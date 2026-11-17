@@ -19,6 +19,9 @@ class RecordTableModel(QAbstractTableModel):
         super().__init__(parent)
         self._records: list[Record] = []
         self._opened_usernames: set[str] = set()
+        self._username_rows: dict[str, list[int]] = {}
+        self._search_values: list[tuple[str, str]] = []
+        self._dates: list[date | None] = []
 
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:  # noqa: N802
         return 0 if parent.isValid() else len(self._records)
@@ -45,6 +48,16 @@ class RecordTableModel(QAbstractTableModel):
         self.beginResetModel()
         self._records = list(records)
         self._opened_usernames.clear()
+        self._username_rows = {}
+        self._search_values = []
+        self._dates = []
+        for row, (username, detail, timestamp) in enumerate(self._records):
+            self._username_rows.setdefault(username.casefold(), []).append(row)
+            self._search_values.append((username.casefold(), detail.casefold()))
+            try:
+                self._dates.append(datetime.fromisoformat(timestamp).date())
+            except ValueError:
+                self._dates.append(None)
         self.endResetModel()
 
     def record_at(self, row: int) -> Record | None:
@@ -55,10 +68,18 @@ class RecordTableModel(QAbstractTableModel):
         if not normalized or normalized in self._opened_usernames:
             return
         self._opened_usernames.add(normalized)
-        for row, record in enumerate(self._records):
-            if record[0].casefold() == normalized:
-                index = self.index(row, 0)
-                self.dataChanged.emit(index, self.index(row, len(self.HEADERS) - 1), [Qt.ItemDataRole.ForegroundRole])
+        for row in self._username_rows.get(normalized, []):
+            index = self.index(row, 0)
+            self.dataChanged.emit(index, self.index(row, len(self.HEADERS) - 1), [Qt.ItemDataRole.ForegroundRole])
+
+    def matches(self, row: int, query: str, use_dates: bool, start: date | None, end: date | None) -> bool:
+        username, detail = self._search_values[row]
+        if query and query not in username and query not in detail:
+            return False
+        if not use_dates:
+            return True
+        item_date = self._dates[row]
+        return bool(start and end and item_date and start <= item_date <= end)
 
     def clear_opened(self) -> None:
         if not self._opened_usernames:
@@ -94,8 +115,9 @@ class RecordFilterProxyModel(QSortFilterProxyModel):
         current_values = (self._query, self._use_dates, self._start_date, self._end_date)
         if next_values == current_values:
             return
+        self.beginFilterChange()
         self._query, self._use_dates, self._start_date, self._end_date = next_values
-        self.invalidate()
+        self.endFilterChange(QSortFilterProxyModel.Direction.Rows)
 
     def filterAcceptsRow(self, source_row: int, source_parent: QModelIndex) -> bool:  # noqa: N802
         model = self.sourceModel()
@@ -104,18 +126,7 @@ class RecordFilterProxyModel(QSortFilterProxyModel):
         record = model.record_at(source_row)
         if record is None:
             return False
-        username, detail, timestamp = record
-        if self._query and self._query not in username.casefold() and self._query not in detail.casefold():
-            return False
-        if not self._use_dates:
-            return True
-        if not self._start_date or not self._end_date or self._start_date > self._end_date:
-            return False
-        try:
-            item_date = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S").date()
-        except ValueError:
-            return False
-        return self._start_date <= item_date <= self._end_date
+        return model.matches(source_row, self._query, self._use_dates, self._start_date, self._end_date)
 
     def filtered_records(self) -> list[Record]:
         model = self.sourceModel()

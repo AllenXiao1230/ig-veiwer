@@ -17,5 +17,6 @@ build/
 dist/
 .pyinstaller-build/
 *.spec
+!scripts/ig_viewer.spec
 
 # Local application state is stored outside this repository by default.
